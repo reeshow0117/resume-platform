@@ -1,0 +1,22 @@
+# 私人简历资料库与证件照(含 PII,绝不提交公开仓库)
+简历资料库/
+agent/profiles/
+agent/state/
+agent/fonts/
+outputs/
+.env
+.env.*
+
+# 运行期 / 构建缓存
+.venv/
+.pytest_cache/
+*.egg-info/
+__pycache__/
+node_modules/
+
+# 系统 / 工具残留
+.DS_Store
+.workbuddy/
+.wrangler/
+dist/.edgeone/
+dist/.env
