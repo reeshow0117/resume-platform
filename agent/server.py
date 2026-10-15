@@ -9,10 +9,12 @@ import argparse
 import base64
 import sqlite3
 import binascii
+import hmac
 import os
 import re
 import sys
 import tempfile
+import time
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -40,6 +42,7 @@ WEB_DIR = os.path.join(ROOT, "web")
 PHOTO_PATH = os.environ.get("QIUZHAO_RESUME_PHOTO", os.path.join(BASE, "profiles", "xiao", "photo.png"))
 PRIVATE_VAULT = os.environ.get("QIUZHAO_PRIVATE_VAULT") == "1"
 ACCESS_DB = os.environ.get("QIUZHAO_ACCESS_DB", "")
+ADMIN_TOKEN = os.environ.get("QIUZHAO_ADMIN_TOKEN", "")
 MAX_JD_LEN = 8000
 _cache = {}
 
@@ -69,6 +72,11 @@ app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET",
 
 class InviteReq(BaseModel):
     invite_code: str = Field(min_length=32, max_length=128)
+
+
+class AdminInviteReq(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    days: int = Field(default=7, ge=1, le=30)
 
 
 class Candidate(BaseModel):
@@ -140,6 +148,29 @@ def access_store():
 def deny_access(exc):
     headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
     raise HTTPException(exc.status, str(exc), headers=headers) from exc
+
+
+# 管理员口令连续失败后短暂锁定，仅为暴力破解兜底；真正的强度来自高熵口令。
+_admin_throttle = {"fails": 0, "locked_until": 0.0}
+
+
+def require_admin(request):
+    """校验自助发码的管理员口令；本机私人模式不开放此接口。口令只存服务端环境文件。"""
+    if not ADMIN_TOKEN or len(ADMIN_TOKEN) < 24:
+        raise HTTPException(503, "自助发码未启用：服务器未配置管理员口令")
+    now = time.monotonic()
+    if now < _admin_throttle["locked_until"]:
+        wait = int(_admin_throttle["locked_until"] - now) + 1
+        raise HTTPException(429, "管理员口令尝试过多，请稍后再试", headers={"Retry-After": str(wait)})
+    header = request.headers.get("Authorization", "")
+    supplied = header[7:] if header.startswith("Bearer ") else ""
+    if not supplied or not hmac.compare_digest(supplied, ADMIN_TOKEN):
+        _admin_throttle["fails"] += 1
+        if _admin_throttle["fails"] >= 5:
+            _admin_throttle["fails"] = 0
+            _admin_throttle["locked_until"] = now + 300
+        raise HTTPException(401, "管理员口令无效")
+    _admin_throttle["fails"] = 0
 
 
 def require_user(request):
@@ -225,7 +256,8 @@ def capabilities(request: Request):
         except HTTPException:
             ready = False
     return {"private_vault": private_allowed(request), "pdf": True,
-            "invite_required": not private_allowed(request), "llm": ready}
+            "invite_required": not private_allowed(request), "llm": ready,
+            "admin_invite": bool(ADMIN_TOKEN) and len(ADMIN_TOKEN) >= 24}
 
 
 @app.post("/api/invite/redeem")
@@ -241,6 +273,21 @@ def redeem_invite(req: InviteReq):
         deny_access(exc)
     except (ValueError, sqlite3.Error) as exc:
         raise HTTPException(503, "访问控制暂不可用") from exc
+
+
+@app.post("/api/admin/invite")
+def admin_invite(req: AdminInviteReq, request: Request):
+    require_admin(request)
+    store = access_store()
+    label = req.label.strip()
+    try:
+        code = store.invite(label, req.days)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(503, "访问控制暂不可用") from exc
+    return {"code": code, "label": label, "days": req.days,
+            "expires_at": int(time.time()) + req.days * 86400}
 
 
 @app.get("/api/quota")
@@ -347,6 +394,11 @@ def index():
 @app.get("/resume.html")
 def resume_page():
     return FileResponse(os.path.join(WEB_DIR, "resume.html"))
+
+
+@app.get("/admin")
+def admin_page():
+    return FileResponse(os.path.join(WEB_DIR, "admin.html"))
 
 
 def main():

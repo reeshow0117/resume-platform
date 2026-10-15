@@ -109,7 +109,67 @@ class ResumeFlowTests(unittest.TestCase):
     def test_static_routes(self):
         self.assertEqual(200, self.client.get("/").status_code)
         self.assertEqual(200, self.client.get("/resume.html").status_code)
+        self.assertEqual(200, self.client.get("/admin").status_code)
         self.assertEqual(404, self.client.get("/jobs_slim.json").status_code)
+
+
+class AdminInviteTests(unittest.TestCase):
+    """自助发码接口：口令鉴权、失败锁定、签发的码可被兑换。"""
+
+    def setUp(self):
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        self.path = os.path.join(state_dir.name, "access.sqlite3")
+        self.store = access.AccessStore(self.path)
+        self.store.init()
+        db_patch = patch.object(server, "ACCESS_DB", self.path)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        env = patch.dict(os.environ, {"QIUZHAO_PLATFORM_MODEL_DAILY_LIMIT": "100"})
+        env.start()
+        self.addCleanup(env.stop)
+        server._admin_throttle.update(fails=0, locked_until=0.0)
+        self.addCleanup(server._admin_throttle.update, fails=0, locked_until=0.0)
+        self.client = TestClient(server.app)
+
+    def _hdr(self, token):
+        return {"Authorization": "Bearer " + token}
+
+    def test_disabled_without_admin_token(self):
+        with patch.object(server, "ADMIN_TOKEN", ""):
+            r = self.client.post("/api/admin/invite", json={"label": "x"}, headers=self._hdr("whatever"))
+            self.assertEqual(503, r.status_code)
+
+    def test_wrong_token_rejected_and_capabilities_flag(self):
+        with patch.object(server, "ADMIN_TOKEN", "A" * 40):
+            self.assertTrue(self.client.get("/api/capabilities").json()["admin_invite"])
+            r = self.client.post("/api/admin/invite", json={"label": "x"}, headers=self._hdr("wrong-token"))
+            self.assertEqual(401, r.status_code)
+            self.assertEqual(401, self.client.post("/api/admin/invite", json={"label": "x"}).status_code)
+
+    def test_valid_token_issues_redeemable_code(self):
+        with patch.object(server, "ADMIN_TOKEN", "A" * 40):
+            r = self.client.post("/api/admin/invite", json={"label": "张三", "days": 5}, headers=self._hdr("A" * 40))
+            self.assertEqual(200, r.status_code)
+            body = r.json()
+            self.assertEqual("张三", body["label"])
+            self.assertEqual(5, body["days"])
+            # 签发的码应能被真实兑换为一个会话
+            session = self.store.redeem(body["code"], 30)
+            self.assertTrue(session)
+
+    def test_bad_label_and_days_rejected(self):
+        with patch.object(server, "ADMIN_TOKEN", "A" * 40):
+            self.assertEqual(422, self.client.post("/api/admin/invite", json={"label": ""}, headers=self._hdr("A" * 40)).status_code)
+            self.assertEqual(422, self.client.post("/api/admin/invite", json={"label": "x", "days": 99}, headers=self._hdr("A" * 40)).status_code)
+
+    def test_lockout_after_repeated_failures(self):
+        with patch.object(server, "ADMIN_TOKEN", "A" * 40):
+            for _ in range(5):
+                self.assertEqual(401, self.client.post("/api/admin/invite", json={"label": "x"}, headers=self._hdr("bad")).status_code)
+            # 第 6 次即便口令正确也应被锁定
+            r = self.client.post("/api/admin/invite", json={"label": "x"}, headers=self._hdr("A" * 40))
+            self.assertEqual(429, r.status_code)
 
 
 if __name__ == "__main__":
